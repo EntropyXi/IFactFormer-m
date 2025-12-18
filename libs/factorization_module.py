@@ -85,7 +85,7 @@ class FABlock3D_m(nn.Module):
 
         self.to_out = nn.Sequential(
             nn.InstanceNorm3d(3 * dim_head * heads),
-            Rearrange('b c i l r -> b i l r c', h=self.heads),
+            Rearrange('b c i l r -> b i l r c'),
             nn.Linear(3 * dim_head * heads, dim_out, bias=False),
             nn.GELU(),
             nn.Linear(dim_out, dim_out, bias=False))
@@ -105,7 +105,7 @@ class FABlock3D_m(nn.Module):
         k_y = self.low_rank_kernel_y(u_y, pos_x=pos_y)
         k_z = self.low_rank_kernel_z(u_z, pos_x=pos_z)
 
-        u_phi = rearrange(v, 'b i l r (h c) -> b h i l r c')
+        u_phi = rearrange(v, 'b i l r (h c) -> b h i l r c', h=self.heads)
         u_phi_x = torch.einsum('bhij,bhjmsc->bhimsc', k_x, u_phi)
         u_phi_y = torch.einsum('bhlm,bhimsc->bhilsc', k_y, u_phi)
         u_phi_z = torch.einsum('bhrs,bhilsc->bhilrc', k_z, u_phi)
