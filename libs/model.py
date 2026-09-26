@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from libs.factorization_module import FABlock3D_m, FABlock3D_m
+from libs.factorization_module import FABlock3D_m, FABlock3D_o
 
 from libs.positional_encoding_module import GaussianFourierFeatureTransform
     
