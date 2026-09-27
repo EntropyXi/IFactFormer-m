@@ -83,6 +83,16 @@ class LowRankKernel(nn.Module):
         x = (x - x.mean(dim=-2, keepdim=True)) / (x.std(dim=-2, keepdim=True) + 1e-5)
         return x
 
+    def _axis_rotary_freqs(self, pos, projected):
+        if pos.ndim == 2:
+            pos = pos.unsqueeze(0)
+        if pos.ndim != 3 or pos.shape[-1] != 1 or pos.shape[1] != projected.shape[2]:
+            raise ValueError("axis positions must have shape [N, 1] or [B, N, 1]")
+        if pos.shape[0] not in (1, projected.shape[0]):
+            raise ValueError("axis position batch must be 1 or match the input batch")
+        freqs = self.pos_emb.forward(pos[..., 0], projected.device)
+        return repeat(freqs, 'b n d -> b h n d', h=projected.shape[1])
+
     def forward(self, u_x, u_y=None, pos_x=None, pos_y=None):
         # u_x, u_y: b n c
         # u_x is from the first source
@@ -149,16 +159,12 @@ class LowRankKernel(nn.Module):
                 q = apply_2d_rotary_pos_emb(q, q_freqs_x, q_freqs_y)
                 k = apply_2d_rotary_pos_emb(k, k_freqs_x, k_freqs_y)
             elif self.pos_dim == 1:
-                assert pos_x.shape[-1] == 1
-
-                q_freqs = self.pos_emb.forward(pos_x[..., 0], q.device).unsqueeze(0)
-                q_freqs = repeat(q_freqs, '1 n d -> b h n d', b=q.shape[0], h=q.shape[1])
+                q_freqs = self._axis_rotary_freqs(pos_x, q)
 
                 if pos_y is None:
                     k_freqs = q_freqs
                 else:
-                    k_freqs = self.pos_emb.forward(pos_y[..., 0], k.device).unsqueeze(0)
-                    k_freqs = repeat(k_freqs, '1 n d -> b h n d', b=q.shape[0], h=q.shape[1])
+                    k_freqs = self._axis_rotary_freqs(pos_y, k)
 
                 q = apply_rotary_pos_emb(q, q_freqs)
                 k = apply_rotary_pos_emb(k, k_freqs)

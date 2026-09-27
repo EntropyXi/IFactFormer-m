@@ -18,11 +18,10 @@ def dict2namespace(config):
 def get_pos_lst(size_lst, length):
     pos_lst = []
     for size in size_lst:
-        nx, ny, nz = size
+        nx, ny = size
         pos_x = torch.linspace(0, length[0], nx).float().cuda().unsqueeze(-1)
         pos_y = torch.linspace(0, length[1], ny).float().cuda().unsqueeze(-1)
-        pos_z = torch.linspace(0, length[2], nz).float().cuda().unsqueeze(-1)
-        pos_lst.append([pos_x, pos_y, pos_z])
+        pos_lst.append([pos_x, pos_y])
     return pos_lst
 
 
@@ -70,6 +69,42 @@ class LpLoss(object):
 
     def __call__(self, x, y):
         return self.rel(x, y)
+
+
+class MaskedLpLoss:
+    """Relative Lp error over valid spatial cells only."""
+
+    def __init__(self, p=2, reduction=True, size_average=True, eps=1e-8):
+        self.p = p
+        self.reduction = reduction
+        self.size_average = size_average
+        self.eps = eps
+
+    def __call__(self, prediction, target, valid_mask):
+        if prediction.shape != target.shape or valid_mask.shape != target.shape[:-1]:
+            raise ValueError("expected prediction/target [B, H, W, C] and mask [B, H, W]")
+        if not valid_mask.reshape(valid_mask.shape[0], -1).any(dim=1).all():
+            raise ValueError("masked loss received a sample without valid ocean pixels")
+
+        valid = valid_mask.bool().unsqueeze(-1)
+        difference = torch.where(valid, prediction - target, 0).reshape(prediction.shape[0], -1)
+        reference = torch.where(valid, target, 0).reshape(target.shape[0], -1)
+        error = torch.linalg.vector_norm(difference, ord=self.p, dim=1)
+        scale = torch.linalg.vector_norm(reference, ord=self.p, dim=1).clamp_min(self.eps)
+        losses = error / scale
+        if not self.reduction:
+            return losses
+        return losses.mean() if self.size_average else losses.sum()
+
+
+def normalize_uv_input(x, mean, std):
+    """Normalize U/V at valid ocean pixels while leaving the mask at 0/1."""
+    if x.shape[-1] != 3 or mean.numel() != 2 or std.numel() != 2:
+        raise ValueError("expected input [..., 3] and two-channel U/V statistics")
+    velocity = torch.where(x[..., 2:3].bool(),
+                           (x[..., :2] - mean) / std,
+                           torch.zeros_like(x[..., :2]))
+    return torch.cat((velocity, x[..., 2:3]), dim=-1)
     
     
     

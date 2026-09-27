@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from einops.layers.torch import Rearrange
-from libs.factorization_module import FABlock3D_m, FABlock3D_o
+from libs.factorization_module import FABlock2D_m, FABlock2D_o
 
 from libs.positional_encoding_module import GaussianFourierFeatureTransform
     
@@ -28,25 +28,35 @@ class FactorizedTransformer(nn.Module):
                 nn.Linear(dim, dim)
             ))
             if model=="IFactFormer_o":
-                layer.append(FABlock3D_o(dim, dim_head, dim, heads, dim_out, use_rope=True, **kwargs))
+                layer.append(FABlock2D_o(dim, dim_head, dim, heads, dim_out, use_rope=True, **kwargs))
             elif model=="IFactFormer_m":
-                layer.append(FABlock3D_m(dim, dim_head, dim, heads, dim_out, use_rope=True, **kwargs))
+                layer.append(FABlock2D_m(dim, dim_head, dim, heads, dim_out, use_rope=True, **kwargs))
             self.layers.append(layer)
             
         self.n_layer = n_layer
+        self.mask_ocean = model == "IFactFormer_m"
 
-    def forward(self, u, pos_lst):
-        b, nx, ny, nz, c = u.shape  # just want to make sure its shape
-        nx, ny, nz = pos_lst[0].shape[0], pos_lst[1].shape[0], pos_lst[2].shape[0]
-        pos = torch.stack(torch.meshgrid([pos_lst[0].squeeze(-1),
-                                          pos_lst[1].squeeze(-1),
-                                          pos_lst[2].squeeze(-1)]
-                                         ), dim=-1).reshape(-1, 3)
+    def forward(self, u, positions, valid_mask=None):
+        b, nx, ny, c = u.shape  # just want to make sure its shape
+        absolute = positions["absolute"]
+        if absolute.shape != (b, nx, ny, 3):
+            raise ValueError("absolute positions must have shape [B, H, W, 3]")
+        pos = rearrange(absolute, 'b nx ny c -> b (nx ny) c')
+        pos_lst = (positions["axis_lat"], positions["axis_lon"])
+        if self.mask_ocean:
+            if valid_mask is None or valid_mask.shape != (b, nx, ny):
+                raise ValueError("IFactFormer_m requires an ocean mask [B, H, W]")
+            spatial_mask = valid_mask.unsqueeze(-1)
         
         for l, (pos_enc, attn_layer) in enumerate(self.layers):
-            u += rearrange(pos_enc(pos), '1 (nx ny nz) c -> 1 nx ny nz c', nx=nx, ny=ny, nz=nz)
+            u = u + rearrange(pos_enc(pos), 'b (nx ny) c -> b nx ny c', nx=nx, ny=ny)
+            if self.mask_ocean:
+                u = u * spatial_mask
             for i in range(self.n_layer):
-                u = u + attn_layer(u, pos_lst) / self.n_layer
+                if self.mask_ocean:
+                    u = (u + attn_layer(u, pos_lst, valid_mask) / self.n_layer) * spatial_mask
+                else:
+                    u = u + attn_layer(u, pos_lst) / self.n_layer
         return u
         
         
@@ -65,7 +75,7 @@ class Model(nn.Module):
         
         
         self.simple_to_out = nn.Sequential(
-            Rearrange('b nx ny nz c -> b c (nx ny nz)'),
+            Rearrange('b nx ny c -> b c (nx ny)'),
             nn.Conv1d(config.dim, config.dim // 2, kernel_size=1, stride=1, padding=0, bias=False),
             nn.GELU(),
             nn.Conv1d(config.dim // 2, config.out_dim, kernel_size=1, stride=1, padding=0, bias=True)
@@ -73,17 +83,25 @@ class Model(nn.Module):
         
     def forward(self,
                 u,
-                pos_lst,
+                positions,
                 ):
-        b, t, nx, ny, nz, c = u.shape
+        b, t, nx, ny, c = u.shape
+        if self.encoder.mask_ocean:
+            if c < 3:
+                raise ValueError("IFactFormer_m requires U, V, and ocean-mask input channels")
+            valid_mask = (u[..., 2] > 0.5).all(dim=1)
+        else:
+            valid_mask = None
         
-        u = rearrange(u, 'b t nx ny nz c -> b c t (nx ny nz)')
+        u = rearrange(u, 'b t nx ny c -> b c t (nx ny)')
         u = self.to_in(u)
-        u = rearrange(u, 'b c 1 (nx ny nz) -> b nx ny nz c', nx=nx, ny=ny, nz=nz)
+        u = rearrange(u, 'b c 1 (nx ny) -> b nx ny c', nx=nx, ny=ny)
+        if valid_mask is not None:
+            u = u * valid_mask.unsqueeze(-1)
         
-        u = self.encoder(u, pos_lst)
+        u = self.encoder(u, positions, valid_mask)
         
         u = self.simple_to_out(u)
-        u = rearrange(u, 'b c (nx ny nz) -> b nx ny nz c', nx=nx, ny=ny)
+        u = rearrange(u, 'b c (nx ny) -> b nx ny c', nx=nx, ny=ny)
         
         return u
