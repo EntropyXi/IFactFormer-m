@@ -8,7 +8,7 @@ model:
     heads: 5
     depth: 1
     dim_head: 96
-    n_layer: 10
+    n_layer: 5
     model: IFactFormer_m
 
 training:
