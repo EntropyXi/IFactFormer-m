@@ -19,6 +19,7 @@ def save_latest(runtime, path, model, optimizer, scheduler, config, args, h5_pat
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        "activation_checkpoint": args.activation_checkpoint,
         "model_config": config["model"],
         "training_config": config["training"],
         "h5_path": str(h5_path),
@@ -45,6 +46,8 @@ def verify_resume(checkpoint, config, args, h5_path, splits, runtime, samples_pe
         raise ValueError("DDP world size differs from the checkpoint")
     if checkpoint["model_config"] != config["model"]:
         raise ValueError("Model config differs from the checkpoint")
+    if checkpoint.get("activation_checkpoint", False) != args.activation_checkpoint:
+        raise ValueError("Activation checkpoint setting differs from the checkpoint")
     for name in ("batch_size", "lr", "scheduler_step", "scheduler_gamma"):
         if checkpoint["training_config"][name] != config["training"][name]:
             raise ValueError(f"Training setting {name} differs from the checkpoint")

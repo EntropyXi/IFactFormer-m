@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--h5", default=DEFAULT_H5)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--ddp", action="store_true", help="Use torchrun for multi-process DDP training")
+    parser.add_argument("--activation-checkpoint", action="store_true",
+                        help="Recompute each factorized-attention iteration during backward")
     parser.add_argument("--local-rank", "--local_rank", type=int, default=None,
                         help=argparse.SUPPRESS)
     parser.add_argument("--resume", help="Latest checkpoint path or its run directory")
@@ -78,6 +80,7 @@ def save_latest(path, model, optimizer, scheduler, config, args, h5_path, splits
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
+        "activation_checkpoint": args.activation_checkpoint,
         "model_config": config["model"],
         "training_config": config["training"],
         "h5_path": str(h5_path),
@@ -102,6 +105,8 @@ def verify_resume(checkpoint, config, args, h5_path, splits):
         raise ValueError("Unsupported checkpoint format")
     if checkpoint["model_config"] != config["model"]:
         raise ValueError("Model config differs from the checkpoint")
+    if checkpoint.get("activation_checkpoint", False) != args.activation_checkpoint:
+        raise ValueError("Activation checkpoint setting differs from the checkpoint")
     for name in ("batch_size", "lr", "scheduler_step", "scheduler_gamma"):
         if checkpoint["training_config"][name] != config["training"][name]:
             raise ValueError(f"Training setting {name} differs from the checkpoint")
@@ -148,9 +153,10 @@ def run(args):
         latest_path = run_dir / CHECKPOINT_NAME
 
     logger = make_logger(run_dir)
-    logger.info("run_dir=%s train/val/test=%d/%d/%d batch_size=%d n_layer=%d epochs=%d",
+    logger.info("run_dir=%s train/val/test=%d/%d/%d batch_size=%d n_layer=%d epochs=%d activation_checkpoint=%s",
                 run_dir, ntrain, nval, ntest, config["training"]["batch_size"],
-                config["model"]["n_layer"], config["training"]["epochs"])
+                config["model"]["n_layer"], config["training"]["epochs"],
+                args.activation_checkpoint)
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -175,7 +181,8 @@ def run(args):
         logger.info("Resuming epoch=%d sample_offset=%d global_step=%d", epoch, sample_offset, global_step)
 
     uv_mean, uv_std = uv_mean.to(device), uv_std.to(device)
-    model = Model(dict2namespace(config["model"])).to(device)
+    model = Model(dict2namespace(config["model"]),
+                  activation_checkpoint=args.activation_checkpoint).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config["training"]["lr"])
     scheduler = torch.optim.lr_scheduler.StepLR(
         optimizer, step_size=config["training"]["scheduler_step"],
@@ -190,7 +197,8 @@ def run(args):
             torch.cuda.set_rng_state(checkpoint["cuda_rng_state"], device)
     else:
         save_latest(latest_path, model, optimizer, scheduler, config, args, h5_path,
-                    splits, uv_mean, uv_std, epoch, sample_offset, global_step, best_val, test_loss)
+                    splits, uv_mean, uv_std, epoch, sample_offset, global_step,
+                    best_val, test_loss)
 
     stop_requested = {"value": False}
 
@@ -229,7 +237,8 @@ def run(args):
                     args.stop_after_steps is not None and steps_this_run >= args.stop_after_steps)
                 if global_step % args.checkpoint_every_steps == 0 or should_stop:
                     save_latest(latest_path, model, optimizer, scheduler, config, args, h5_path,
-                                splits, uv_mean, uv_std, epoch, sample_offset, global_step, best_val, test_loss)
+                                splits, uv_mean, uv_std, epoch, sample_offset,
+                                global_step, best_val, test_loss)
                     logger.info("checkpoint saved at epoch=%d samples=%d/%d", epoch, sample_offset, ntrain)
                 if should_stop:
                     logger.info("Stopped safely; resume with --resume %s", latest_path)
@@ -238,10 +247,12 @@ def run(args):
             # A completed training epoch is saved before validation. If validation
             # is interrupted, resume will repeat validation without optimizer steps.
             save_latest(latest_path, model, optimizer, scheduler, config, args, h5_path,
-                        splits, uv_mean, uv_std, epoch, ntrain, global_step, best_val, test_loss)
+                        splits, uv_mean, uv_std, epoch, ntrain, global_step,
+                        best_val, test_loss)
             val_loader = make_loader(dataset, range(ntrain, ntrain + nval), batch_size,
                                      args.num_workers, device, args.seed + 1000000 + epoch)
-            val_loss = evaluate(model, val_loader, loss_fn, device, uv_mean, uv_std, stop_requested)
+            val_loss = evaluate(model, val_loader, loss_fn, device, uv_mean, uv_std,
+                                stop_requested)
             if val_loss is None:
                 logger.info("Validation interrupted; resume with --resume %s", latest_path)
                 return 0
@@ -255,7 +266,8 @@ def run(args):
             epoch += 1
             sample_offset = 0
             save_latest(latest_path, model, optimizer, scheduler, config, args, h5_path,
-                        splits, uv_mean, uv_std, epoch, sample_offset, global_step, best_val, test_loss)
+                        splits, uv_mean, uv_std, epoch, sample_offset, global_step,
+                        best_val, test_loss)
 
         if test_loss is None:
             best = torch.load(best_path, map_location=device, weights_only=True)
@@ -264,14 +276,16 @@ def run(args):
             model.load_state_dict(best["model"])
             test_loader = make_loader(dataset, range(ntrain + nval, len(dataset)), batch_size,
                                       args.num_workers, device, args.seed + 2000000)
-            test_loss = evaluate(model, test_loader, loss_fn, device, uv_mean, uv_std, stop_requested)
+            test_loss = evaluate(model, test_loader, loss_fn, device, uv_mean, uv_std,
+                                 stop_requested)
             if test_loss is None:
                 logger.info("Test interrupted; resume with --resume %s", latest_path)
                 return 0
             logger.info("test_L2=%.6f best_epoch=%d", test_loss, best["epoch"])
             model.load_state_dict(final_train_state)
             save_latest(latest_path, model, optimizer, scheduler, config, args, h5_path,
-                        splits, uv_mean, uv_std, epoch, 0, global_step, best_val, test_loss)
+                        splits, uv_mean, uv_std, epoch, 0, global_step,
+                        best_val, test_loss)
         else:
             logger.info("Run already completed: test_L2=%.6f", test_loss)
         return 0

@@ -53,7 +53,8 @@ def make_fixture(directory):
     return h5_path, config_path
 
 
-def invoke(h5_path, config_path, run_dir=None, resume=None, stop_after=None):
+def invoke(h5_path, config_path, run_dir=None, resume=None, stop_after=None,
+           activation_checkpoint=False):
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
@@ -67,6 +68,8 @@ def invoke(h5_path, config_path, run_dir=None, resume=None, stop_after=None):
         command += ["--resume", str(resume)]
     if stop_after is not None:
         command += ["--stop-after-steps", str(stop_after)]
+    if activation_checkpoint:
+        command += ["--activation-checkpoint"]
     processes = []
     for rank in range(4):
         environment = os.environ.copy()
@@ -89,11 +92,20 @@ def invoke(h5_path, config_path, run_dir=None, resume=None, stop_after=None):
             print(stdout[-1200:])
 
 
-def invoke_single(h5_path, config_path, run_dir):
+def invoke_single(h5_path, config_path, run_dir=None, resume=None, stop_after=None,
+                  activation_checkpoint=False):
     command = [sys.executable, "-B", "main.py", "--device", "cpu",
                "--config", str(config_path), "--h5", str(h5_path),
                "--patches-per-day", "2", "--num-workers", "0",
-               "--run-dir", str(run_dir)]
+               "--checkpoint-every-steps", "2"]
+    if run_dir is not None:
+        command += ["--run-dir", str(run_dir)]
+    if resume is not None:
+        command += ["--resume", str(resume)]
+    if stop_after is not None:
+        command += ["--stop-after-steps", str(stop_after)]
+    if activation_checkpoint:
+        command += ["--activation-checkpoint"]
     result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
                             timeout=180)
     if result.returncode:
@@ -106,15 +118,17 @@ def main():
         h5_path, config_path = make_fixture(directory)
         resumed = directory / "resumed"
         full = directory / "full"
-        invoke(h5_path, config_path, run_dir=resumed, stop_after=2)
+        invoke(h5_path, config_path, run_dir=resumed, stop_after=2,
+               activation_checkpoint=True)
         partial = torch.load(resumed / "checkpoint_latest.pt", weights_only=True)
         assert partial["format_version"] == 2
         assert partial["world_size"] == 4
         assert partial["local_offset"] == 2
         assert partial["global_step"] == 2
         assert partial["samples_per_rank"] == 4  # 14 true + 2 padded
-        invoke(h5_path, config_path, resume=resumed)
-        invoke(h5_path, config_path, run_dir=full)
+        assert partial["activation_checkpoint"] is True
+        invoke(h5_path, config_path, resume=resumed, activation_checkpoint=True)
+        invoke(h5_path, config_path, run_dir=full, activation_checkpoint=True)
         resumed_state = torch.load(resumed / "checkpoint_latest.pt", weights_only=True)
         full_state = torch.load(full / "checkpoint_latest.pt", weights_only=True)
         assert resumed_state["global_step"] == full_state["global_step"] == 8
@@ -126,10 +140,22 @@ def main():
                              for name in resumed_state["model"])
         print("maximum resumed/full parameter difference:", max_difference)
         assert max_difference < 1e-6
-        single = directory / "single"
-        invoke_single(h5_path, config_path, single)
+        single = directory / "single_resumed"
+        invoke_single(h5_path, config_path, run_dir=single, stop_after=2,
+                      activation_checkpoint=True)
+        single_partial = torch.load(single / "checkpoint_latest.pt", weights_only=True)
+        assert single_partial["activation_checkpoint"] is True
+        invoke_single(h5_path, config_path, resume=single, activation_checkpoint=True)
         single_state = torch.load(single / "checkpoint_latest.pt", weights_only=True)
         assert single_state["format_version"] == 1 and single_state["epoch"] == 2
+        single_full = directory / "single_full"
+        invoke_single(h5_path, config_path, run_dir=single_full,
+                      activation_checkpoint=True)
+        full_single_state = torch.load(single_full / "checkpoint_latest.pt", weights_only=True)
+        single_difference = max(
+            (single_state["model"][name] - full_single_state["model"][name]).abs().max().item()
+            for name in single_state["model"])
+        assert single_difference < 1e-6
         print("PASS: four ranks, uneven split, numerically consistent resume, single-GPU regression")
 
 

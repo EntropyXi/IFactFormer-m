@@ -92,10 +92,11 @@ def _run_ddp(args, runtime):
 
         logger = make_logger(run_dir) if runtime.primary else None
         if runtime.primary:
-            logger.info("DDP run_dir=%s world_size=%d per_gpu_batch=%d global_batch=%d epochs=%d",
+            logger.info("DDP run_dir=%s world_size=%d per_gpu_batch=%d global_batch=%d epochs=%d activation_checkpoint=%s",
                         run_dir, runtime.world_size, config["training"]["batch_size"],
                         runtime.world_size * config["training"]["batch_size"],
-                        config["training"]["epochs"])
+                        config["training"]["epochs"],
+                        args.activation_checkpoint)
             logger.info("train/val/test=%d/%d/%d; training padding=%d samples per epoch",
                         ntrain, nval, ntest, padded_count - ntrain)
 
@@ -127,7 +128,8 @@ def _run_ddp(args, runtime):
                             epoch, local_offset, global_step)
 
         uv_mean, uv_std = runtime.broadcast_stats(mean, std)
-        model = Model(dict2namespace(config["model"])).to(runtime.device)
+        model = Model(dict2namespace(config["model"]),
+                      activation_checkpoint=args.activation_checkpoint).to(runtime.device)
         optimizer = torch.optim.AdamW(model.parameters(), lr=config["training"]["lr"])
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=config["training"]["scheduler_step"],

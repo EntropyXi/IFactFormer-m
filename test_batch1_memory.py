@@ -17,7 +17,13 @@ def main():
     parser.add_argument("--config", default="configs/IFactFormer.yml")
     parser.add_argument("--index", type=int, default=0)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--activation-checkpoint", action="store_true")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--steps", type=int, default=1,
+                        help="Number of optimizer steps for a steady-state timing probe")
     args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("--steps must be positive")
 
     with open(args.config, encoding="utf-8") as config_file:
         config = dict2namespace(yaml.safe_load(config_file))
@@ -28,11 +34,14 @@ def main():
         dataset.close()
 
     device = torch.device(args.device)
+    torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(args.seed)
     x = x.unsqueeze(0).to(device)
     y = y.unsqueeze(0).to(device)
     target_valid = target_valid.unsqueeze(0).to(device)
     positions = {key: value.unsqueeze(0).to(device) for key, value in positions.items()}
-    model = Model(config.model).to(device).train()
+    model = Model(config.model, activation_checkpoint=args.activation_checkpoint).to(device).train()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.training.lr)
     loss_fn = MaskedLpLoss(reduction=False)
     uv_mean = torch.zeros(2, device=device)
@@ -42,18 +51,24 @@ def main():
     torch.cuda.reset_peak_memory_stats(device)
     free, total = torch.cuda.mem_get_info(device)
     print(f"device={torch.cuda.get_device_name(device)} free_GiB={free / 2**30:.2f} total_GiB={total / 2**30:.2f}", flush=True)
+    print(f"activation_checkpoint={args.activation_checkpoint} n_layer={config.model.n_layer}", flush=True)
     print(f"input={tuple(x.shape)} target={tuple(y.shape)} valid_pixels={target_valid.sum().item()}", flush=True)
     stage = "forward"
-    start = time.perf_counter()
+    timings = []
     try:
-        prediction = model(x, positions)
-        stage = "loss"
-        loss = loss_fn(prediction, y, target_valid).mean()
-        stage = "backward"
-        loss.backward()
-        stage = "optimizer"
-        optimizer.step()
-        torch.cuda.synchronize(device)
+        for step in range(args.steps):
+            stage = f"step_{step + 1}_forward"
+            start = time.perf_counter()
+            optimizer.zero_grad(set_to_none=True)
+            prediction = model(x, positions)
+            stage = f"step_{step + 1}_loss"
+            loss = loss_fn(prediction, y, target_valid).mean()
+            stage = f"step_{step + 1}_backward"
+            loss.backward()
+            stage = f"step_{step + 1}_optimizer"
+            optimizer.step()
+            torch.cuda.synchronize(device)
+            timings.append(time.perf_counter() - start)
     except torch.cuda.OutOfMemoryError as error:
         print(f"CUDA_OOM stage={stage}: {str(error).splitlines()[0]}", flush=True)
         raise
@@ -61,7 +76,10 @@ def main():
         print(f"peak_allocated_GiB={torch.cuda.max_memory_allocated(device) / 2**30:.2f} "
               f"peak_reserved_GiB={torch.cuda.max_memory_reserved(device) / 2**30:.2f}", flush=True)
 
-    print(f"batch1_step_ok seconds={time.perf_counter() - start:.2f} loss={loss.item():.6f}", flush=True)
+    steady = timings[1:] if len(timings) > 1 else timings
+    print(f"batch1_step_ok steps={args.steps} first_seconds={timings[0]:.3f} "
+          f"steady_mean_seconds={sum(steady) / len(steady):.3f} "
+          f"loss={loss.item():.6f}", flush=True)
 
 
 if __name__ == "__main__":

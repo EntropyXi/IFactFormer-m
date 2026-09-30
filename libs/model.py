@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as activation_checkpoint_fn
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from libs.factorization_module import FABlock2D_m, FABlock2D_o
@@ -16,6 +17,7 @@ class FactorizedTransformer(nn.Module):
                  depth,
                  n_layer,
                  model,
+                 activation_checkpoint=False,
                  **kwargs
              ):
         super().__init__()
@@ -35,6 +37,7 @@ class FactorizedTransformer(nn.Module):
             
         self.n_layer = n_layer
         self.mask_ocean = model == "IFactFormer_m"
+        self.activation_checkpoint = activation_checkpoint
 
     def forward(self, u, positions, valid_mask=None):
         b, nx, ny, c = u.shape  # just want to make sure its shape
@@ -54,15 +57,25 @@ class FactorizedTransformer(nn.Module):
                 u = u * spatial_mask
             for i in range(self.n_layer):
                 if self.mask_ocean:
-                    u = (u + attn_layer(u, pos_lst, valid_mask) / self.n_layer) * spatial_mask
+                    if self.training and self.activation_checkpoint:
+                        update = activation_checkpoint_fn(
+                            attn_layer, u, pos_lst, valid_mask, use_reentrant=False)
+                    else:
+                        update = attn_layer(u, pos_lst, valid_mask)
+                    u = (u + update / self.n_layer) * spatial_mask
                 else:
-                    u = u + attn_layer(u, pos_lst) / self.n_layer
+                    if self.training and self.activation_checkpoint:
+                        update = activation_checkpoint_fn(
+                            attn_layer, u, pos_lst, use_reentrant=False)
+                    else:
+                        update = attn_layer(u, pos_lst)
+                    u = u + update / self.n_layer
         return u
         
         
         
 class Model(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, activation_checkpoint=False):
         super().__init__()
         
         self.to_in = nn.Sequential(
@@ -71,7 +84,10 @@ class Model(nn.Module):
             nn.Conv2d(config.dim // 2, config.dim, kernel_size=(config.in_time_window, 1), stride=1, padding=0, bias=False),
         )
 
-        self.encoder = FactorizedTransformer(config.dim, config.dim_head, config.heads, config.dim, config.depth, config.n_layer, config.model)
+        self.encoder = FactorizedTransformer(
+            config.dim, config.dim_head, config.heads, config.dim,
+            config.depth, config.n_layer, config.model,
+            activation_checkpoint=activation_checkpoint)
         
         
         self.simple_to_out = nn.Sequential(
