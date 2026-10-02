@@ -35,7 +35,7 @@ def evaluate_distributed(model, loader, loss_fn, runtime, uv_mean, uv_std, stop_
             prediction = model(x, positions) * uv_std + uv_mean
             losses = loss_fn(prediction, y, valid)
             loss_sum += losses.sum().item()
-            count += losses.numel()
+            count += valid.flatten(1).any(dim=1).sum().item()
             if stop_requested["value"]:
                 break
     stopped = runtime.any_true(stop_requested["value"])
@@ -60,7 +60,8 @@ def _run_ddp(args, runtime):
         raise ValueError("Epoch count and per-rank batch size must be positive")
     h5_path = Path(args.h5).resolve()
     dataset = CopernicusH5Dataset(h5_path, patches_per_day=args.patches_per_day,
-                                  input_days=config["model"]["in_time_window"])
+                                  input_days=config["model"]["in_time_window"],
+                                  window_size=args.window_size)
     try:
         splits = split_counts(dataset)
         ntrain, nval, ntest = splits
@@ -176,12 +177,17 @@ def _run_ddp(args, runtime):
             for batch in train_loader:
                 x, y, valid, positions = move_batch(batch, runtime.device, uv_mean, uv_std)
                 prediction = ddp_model(x, positions) * uv_std + uv_mean
-                loss = loss_fn(prediction, y, valid).mean()
+                losses = loss_fn(prediction, y, valid)
+                valid_samples = runtime.sum_int(valid.flatten(1).any(dim=1).sum().item())
+                # DDP averages gradients across ranks; undo that factor so the
+                # update is the mean over all valid ocean samples globally.
+                loss = losses.sum() * (runtime.world_size / max(valid_samples, 1))
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite DDP loss at epoch {epoch}, step {global_step}")
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                optimizer.step()
+                if valid_samples:
+                    optimizer.step()
                 local_offset += x.shape[0]
                 global_step += 1
                 steps_this_run += 1

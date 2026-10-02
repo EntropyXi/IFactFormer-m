@@ -117,7 +117,8 @@ def finalize_pixel_errors(totals):
     return result
 
 
-def plot_patch(path, target, prediction, valid, sample_index, target_day, patch_index):
+def plot_patch(path, target, prediction, valid, sample_index, target_day, patch_index,
+               tile_row=0, tile_col=0):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -142,7 +143,8 @@ def plot_patch(path, target, prediction, valid, sample_index, target_day, patch_
                                           vmax=None if col == 2 else high)
             axes[row, col].set_title(f"{label}: {title}")
             fig.colorbar(image, ax=axes[row, col], shrink=0.75)
-    fig.suptitle(f"Test sample {sample_index} | target day {target_day} | patch {patch_index}")
+    fig.suptitle(f"Test sample {sample_index} | target day {target_day} | "
+                 f"patch {patch_index} | tile ({tile_row}, {tile_col})")
     fig.savefig(path, dpi=140)
     plt.close(fig)
 
@@ -160,7 +162,8 @@ def evaluate(args):
     h5_path = (args.h5 if args.h5 is not None else Path(latest["h5_path"])).resolve()
     dataset = CopernicusH5Dataset(
         h5_path, patches_per_day=int(latest["patches_per_day"]),
-        input_days=int(latest["model_config"]["in_time_window"]))
+        input_days=int(latest["model_config"]["in_time_window"]),
+        window_size=latest.get("window_size"))
     try:
         splits = split_counts(dataset)
         if tuple(latest["splits"]) != splits:
@@ -174,6 +177,7 @@ def evaluate(args):
         output_dir = new_output_directory(run_dir, args.output_dir)
 
         model_loss_sum = 0.0
+        valid_samples = 0
         common_model_loss_sum = 0.0
         persistence_loss_sum = 0.0
         common_samples = 0
@@ -184,6 +188,7 @@ def evaluate(args):
         relative_loss = MaskedLpLoss(reduction=False)
         processed = 0
         fields = ("test_sample_index", "dataset_index", "target_day_index", "patch_index",
+                  "tile_row", "tile_col", "window_y0", "window_x0",
                   "valid_ocean_pixels", "common_ocean_pixels", "model_relative_l2",
                   "model_relative_l2_common", "persistence_relative_l2_common")
         with (output_dir / "per_sample.csv").open("w", newline="", encoding="utf-8") as csv_file:
@@ -200,6 +205,7 @@ def evaluate(args):
                     prediction = model(normalized, positions) * std + mean
                     model_losses = relative_loss(prediction, target, valid)
                     model_loss_sum += model_losses.sum().item()
+                    valid_samples += int(valid.flatten(1).any(dim=1).sum().item())
                     add_pixel_errors(model_pixels, prediction, target, valid)
 
                     previous_valid = x_raw[:, -1, ..., 2].bool()
@@ -209,15 +215,22 @@ def evaluate(args):
                     for local_index in range(target.shape[0]):
                         sample_index = processed + local_index
                         dataset_index = ntrain + nval + sample_index
-                        first_day, patch = divmod(dataset_index, dataset.patches_per_day)
+                        first_day, patch, tile_row, tile_col = dataset.decode_index(dataset_index)
+                        y0, _, x0, _ = dataset.window_bounds(tile_row, tile_col)
+                        has_ocean = bool(valid[local_index].any().item())
                         row = {
                             "test_sample_index": sample_index,
                             "dataset_index": dataset_index,
                             "target_day_index": first_day + dataset.input_days,
                             "patch_index": patch,
+                            "tile_row": tile_row,
+                            "tile_col": tile_col,
+                            "window_y0": y0,
+                            "window_x0": x0,
                             "valid_ocean_pixels": int(valid[local_index].sum().item()),
                             "common_ocean_pixels": int(common_valid[local_index].sum().item()),
-                            "model_relative_l2": float(model_losses[local_index].item()),
+                            "model_relative_l2": (float(model_losses[local_index].item())
+                                                  if has_ocean else ""),
                             "model_relative_l2_common": "",
                             "persistence_relative_l2_common": "",
                         }
@@ -236,17 +249,19 @@ def evaluate(args):
                             add_pixel_errors(model_common_pixels, forecast, truth, common)
                             add_pixel_errors(persistence_pixels, previous, truth, common)
                         writer.writerow(row)
-                        if sample_index in plot_indices:
+                        if sample_index in plot_indices and has_ocean:
                             plot_patch(output_dir / f"sample_{sample_index:05d}.png",
                                        target[local_index].cpu(), prediction[local_index].cpu(),
                                        valid[local_index].cpu(), sample_index,
-                                       row["target_day_index"], patch)
+                                       row["target_day_index"], patch, tile_row, tile_col)
                     processed += target.shape[0]
                     if processed % 500 == 0 or processed == sample_count:
                         print(f"Evaluated {processed}/{sample_count} test samples", flush=True)
 
         if processed != sample_count:
             raise RuntimeError(f"Expected {sample_count} samples, received {processed}")
+        if valid_samples == 0:
+            raise ValueError("Evaluation contains no valid ocean samples")
         common_pixel_count = model_common_pixels["pixels"]
         summary = {
             "h5_path": str(h5_path),
@@ -255,11 +270,13 @@ def evaluate(args):
             "best_epoch_zero_based": int(best["epoch"]) if "epoch" in best else None,
             "input_days": dataset.input_days,
             "forecast_days": 1,
+            "window_size": dataset.window_size,
             "split_samples": {"train": ntrain, "validation": nval, "test": ntest},
             "evaluated_test_samples": processed,
+            "valid_ocean_samples": valid_samples,
             "complete_test_set": processed == ntest,
             "model": {
-                "sample_mean_masked_relative_l2": model_loss_sum / processed,
+                "sample_mean_masked_relative_l2": model_loss_sum / valid_samples,
                 "target_ocean_pixel_metrics": finalize_pixel_errors(model_pixels),
             },
             "persistence_comparison": {

@@ -18,8 +18,10 @@ def split_counts(dataset):
     test_days = window_days - train_days - val_days
     if min(train_days, val_days, test_days) < 1:
         raise ValueError("Each split must contain at least one target day")
-    patches = dataset.patches_per_day
-    return train_days * patches, val_days * patches, test_days * patches
+    samples_per_day = dataset.samples_per_day
+    return (train_days * samples_per_day,
+            val_days * samples_per_day,
+            test_days * samples_per_day)
 
 
 def new_run_directory(config, explicit):

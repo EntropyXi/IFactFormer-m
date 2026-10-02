@@ -83,8 +83,7 @@ class MaskedLpLoss:
     def __call__(self, prediction, target, valid_mask):
         if prediction.shape != target.shape or valid_mask.shape != target.shape[:-1]:
             raise ValueError("expected prediction/target [B, H, W, C] and mask [B, H, W]")
-        if not valid_mask.reshape(valid_mask.shape[0], -1).any(dim=1).all():
-            raise ValueError("masked loss received a sample without valid ocean pixels")
+        has_ocean = valid_mask.reshape(valid_mask.shape[0], -1).any(dim=1)
 
         valid = valid_mask.bool().unsqueeze(-1)
         difference = torch.where(valid, prediction - target, 0).reshape(prediction.shape[0], -1)
@@ -94,7 +93,8 @@ class MaskedLpLoss:
         losses = error / scale
         if not self.reduction:
             return losses
-        return losses.mean() if self.size_average else losses.sum()
+        # All-land samples contribute zero gradient without diluting the mean.
+        return losses.sum() / has_ocean.sum().clamp_min(1) if self.size_average else losses.sum()
 
 
 def normalize_uv_input(x, mean, std):

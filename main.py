@@ -42,6 +42,8 @@ def parse_args():
     parser.add_argument("--resume", help="Latest checkpoint path or its run directory")
     parser.add_argument("--run-dir", help="Directory for a new run; must not exist")
     parser.add_argument("--patches-per-day", type=int, default=131)
+    parser.add_argument("--window-size", type=int, default=112,
+                        help="Non-overlapping spatial crop side length")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--checkpoint-every-steps", type=int, default=100)
     parser.add_argument("--log-every-steps", type=int, default=100)
@@ -50,8 +52,9 @@ def parse_args():
     args = parser.parse_args()
     if args.resume and args.run_dir:
         parser.error("--resume and --run-dir cannot be used together")
-    if args.num_workers < 0 or args.checkpoint_every_steps < 1 or args.log_every_steps < 1:
-        parser.error("worker count must be nonnegative and step intervals must be positive")
+    if (args.window_size < 1 or args.num_workers < 0 or
+            args.checkpoint_every_steps < 1 or args.log_every_steps < 1):
+        parser.error("window size and step intervals must be positive; worker count must be nonnegative")
     if args.stop_after_steps is not None and args.stop_after_steps < 1:
         parser.error("--stop-after-steps must be positive")
     return args
@@ -67,9 +70,11 @@ def evaluate(model, loader, loss_fn, device, uv_mean, uv_std, stop_requested):
             prediction = model(x, positions) * uv_std + uv_mean
             losses = loss_fn(prediction, y, valid)
             loss_sum += losses.sum().item()
-            sample_count += losses.numel()
+            sample_count += valid.flatten(1).any(dim=1).sum().item()
             if stop_requested["value"]:
                 return None
+    if sample_count == 0:
+        raise ValueError("Evaluation contains no valid ocean samples")
     return loss_sum / sample_count
 
 
@@ -86,6 +91,7 @@ def save_latest(path, model, optimizer, scheduler, config, args, h5_path, splits
         "h5_path": str(h5_path),
         "splits": splits,
         "patches_per_day": args.patches_per_day,
+        "window_size": args.window_size,
         "seed": args.seed,
         "uv_mean": uv_mean.detach().cpu(),
         "uv_std": uv_std.detach().cpu(),
@@ -114,6 +120,8 @@ def verify_resume(checkpoint, config, args, h5_path, splits):
         raise ValueError("Dataset path or train/validation/test split differs from the checkpoint")
     if checkpoint["patches_per_day"] != args.patches_per_day or checkpoint["seed"] != args.seed:
         raise ValueError("Patch count or shuffle seed differs from the checkpoint")
+    if checkpoint.get("window_size") != args.window_size:
+        raise ValueError("Window size differs from the checkpoint")
     if checkpoint["epoch"] > config["training"]["epochs"]:
         raise ValueError("Configured epochs are fewer than completed epochs")
     if not 0 <= checkpoint["sample_offset"] <= splits[0]:
@@ -134,7 +142,8 @@ def run(args):
         raise RuntimeError("CUDA is not available")
     h5_path = Path(args.h5).resolve()
     dataset = CopernicusH5Dataset(h5_path, patches_per_day=args.patches_per_day,
-                                  input_days=config["model"]["in_time_window"])
+                                  input_days=config["model"]["in_time_window"],
+                                  window_size=args.window_size)
     splits = split_counts(dataset)
     ntrain, nval, ntest = splits
 
@@ -221,12 +230,15 @@ def run(args):
             for batch in train_loader:
                 x, y, valid, positions = move_batch(batch, device, uv_mean, uv_std)
                 prediction = model(x, positions) * uv_std + uv_mean
-                loss = loss_fn(prediction, y, valid).mean()
+                losses = loss_fn(prediction, y, valid)
+                valid_samples = valid.flatten(1).any(dim=1).sum()
+                loss = losses.sum() / valid_samples.clamp_min(1)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Non-finite training loss at epoch {epoch}, step {global_step}")
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
-                optimizer.step()
+                if valid_samples.item():
+                    optimizer.step()
                 sample_offset += x.shape[0]
                 global_step += 1
                 steps_this_run += 1

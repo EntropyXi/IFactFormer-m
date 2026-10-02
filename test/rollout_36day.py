@@ -65,17 +65,20 @@ def new_output_directory(run_dir, explicit):
     raise RuntimeError("No unused rollout directory was found")
 
 
-def load_seed(h5_file, first_input_day, patch, patches_per_day, input_days, device):
+def load_seed(h5_file, first_input_day, patch, patches_per_day, input_days, device,
+              bounds=None):
     """Read only pre-test input days and their first-day coordinates."""
     rows = first_input_day * patches_per_day + patch + np.arange(input_days) * patches_per_day
-    uv = np.asarray(h5_file["uovo_data"][rows], dtype=np.float32)
-    land = np.asarray(h5_file["mask"][rows], dtype=np.bool_)
+    y0, y1, x0, x1 = bounds if bounds is not None else (0, None, 0, None)
+    ys, xs = slice(y0, y1), slice(x0, x1)
+    uv = np.asarray(h5_file["uovo_data"][rows, :, ys, xs], dtype=np.float32)
+    land = np.asarray(h5_file["mask"][rows, ys, xs], dtype=np.bool_)
     valid = (~land) & np.isfinite(uv).all(axis=1)
     clean_uv = np.where(valid[:, None], uv, 0.0)
     history = np.concatenate((np.moveaxis(clean_uv, 1, -1),
                               valid[..., None].astype(np.float32)), axis=-1)
-    positions = build_patch_positions(h5_file["lat"][int(rows[0])],
-                                      h5_file["lon"][int(rows[0])])
+    positions = build_patch_positions(h5_file["lat"][int(rows[0]), ys, xs],
+                                      h5_file["lon"][int(rows[0]), ys, xs])
     positions = {key: value.unsqueeze(0).to(device) for key, value in positions.items()}
     return (torch.from_numpy(history.copy()).unsqueeze(0).to(device),
             positions, valid[-1])
@@ -109,8 +112,10 @@ def iter_free_rollout(model, history, positions, uv_mean, uv_std, horizon_days):
 
 
 def create_predictions_h5(path, horizon_days, patch_count, spatial_shape,
-                          first_target_day, input_days, source_path, best_path):
+                          first_target_day, input_days, source_path, best_path,
+                          chunk_shape=None):
     height, width = spatial_shape
+    chunk_height, chunk_width = chunk_shape or spatial_shape
     output = h5py.File(path, "w")
     output.attrs["status"] = "incomplete"
     output.attrs["completed_patches"] = 0
@@ -123,11 +128,11 @@ def create_predictions_h5(path, horizon_days, patch_count, spatial_shape,
     output.attrs["mask_policy"] = "Reuse last observed valid mask; never read future masks as model input"
     predictions = output.create_dataset(
         "pred_uv", shape=(horizon_days, patch_count, 2, height, width), dtype="f4",
-        chunks=(1, 1, 2, height, width), compression="lzf", shuffle=True,
+        chunks=(1, 1, 2, chunk_height, chunk_width), compression="lzf", shuffle=True,
         fillvalue=np.nan)
     seed_masks = output.create_dataset(
         "seed_ocean_mask", shape=(patch_count, height, width), dtype="bool",
-        chunks=(1, height, width), compression="lzf")
+        chunks=(1, chunk_height, chunk_width), compression="lzf")
     output.create_dataset("target_day_indices", data=np.arange(
         first_target_day, first_target_day + horizon_days, dtype=np.int32))
     output.create_dataset("patch_indices", data=np.arange(patch_count, dtype=np.int32))
@@ -146,19 +151,20 @@ def evaluate(args):
     input_days = int(latest["model_config"]["in_time_window"])
     patches_per_day = int(latest["patches_per_day"])
     dataset = CopernicusH5Dataset(h5_path, patches_per_day=patches_per_day,
-                                  input_days=input_days)
+                                  input_days=input_days,
+                                  window_size=latest.get("window_size"))
     try:
         splits = split_counts(dataset)
         if tuple(latest["splits"]) != splits:
             raise ValueError(f"H5 split {splits} differs from checkpoint {latest['splits']}")
         ntrain, nval, ntest = splits
-        if (ntrain + nval) % patches_per_day or ntest % patches_per_day:
+        if (ntrain + nval) % dataset.samples_per_day or ntest % dataset.samples_per_day:
             raise ValueError("Test split must begin and end on day boundaries")
-        test_days = ntest // patches_per_day
+        test_days = ntest // dataset.samples_per_day
         if args.horizon_days > test_days:
             raise ValueError(f"Horizon {args.horizon_days} exceeds {test_days} held-out days")
         patch_count = min(patches_per_day, args.max_patches or patches_per_day)
-        first_input_day = (ntrain + nval) // patches_per_day
+        first_input_day = (ntrain + nval) // dataset.samples_per_day
         first_target_day = first_input_day + input_days
         if first_target_day + args.horizon_days > dataset.num_days:
             raise ValueError("Forecast horizon extends beyond the H5 time axis")
@@ -176,16 +182,29 @@ def evaluate(args):
             writer = csv.DictWriter(detail_file, fieldnames=fields)
             writer.writeheader()
             output_h5, predictions, seed_masks = create_predictions_h5(
-                output_dir / "predictions.h5", horizon, patch_count, dataset.spatial_shape,
-                first_target_day, input_days, h5_path, best_path)
+                output_dir / "predictions.h5", horizon, patch_count,
+                dataset.source_spatial_shape,
+                first_target_day, input_days, h5_path, best_path,
+                chunk_shape=dataset.spatial_shape)
             with output_h5, torch.inference_mode():
                 for patch in range(patch_count):
-                    history, positions, seed_valid = load_seed(
-                        source, first_input_day, patch, patches_per_day, input_days, device)
-                    seed_masks[patch] = seed_valid
-                    seed_valid_device = torch.from_numpy(seed_valid.copy()).unsqueeze(0).to(device)
-                    for lead_index, prediction in enumerate(
-                            iter_free_rollout(model, history, positions, mean, std, horizon)):
+                    for tile_row in range(dataset.window_rows):
+                        for tile_col in range(dataset.window_cols):
+                            y0, y1, x0, x1 = dataset.window_bounds(tile_row, tile_col)
+                            history, positions, seed_valid = load_seed(
+                                source, first_input_day, patch, patches_per_day,
+                                input_days, device, bounds=(y0, y1, x0, x1))
+                            seed_masks[patch, y0:y1, x0:x1] = seed_valid
+                            for lead_index, prediction in enumerate(
+                                    iter_free_rollout(model, history, positions,
+                                                      mean, std, horizon)):
+                                predictions[lead_index, patch, :, y0:y1, x0:x1] = np.moveaxis(
+                                    prediction[0].cpu().numpy(), -1, 0)
+
+                    seed_valid_device = torch.from_numpy(seed_masks[patch]).unsqueeze(0).to(device)
+                    for lead_index in range(horizon):
+                        prediction = torch.from_numpy(np.moveaxis(
+                            predictions[lead_index, patch], 0, -1).copy()).unsqueeze(0).to(device)
                         target_day = first_target_day + lead_index
                         # This read occurs after prediction; target never enters history.
                         target, target_valid = read_target(
@@ -206,8 +225,6 @@ def evaluate(args):
                             "valid_ocean_pixels": valid_count,
                             "valid_pixels_in_seed_mask": covered_count,
                         })
-                        predictions[lead_index, patch] = np.moveaxis(
-                            prediction[0].cpu().numpy(), -1, 0)
                     output_h5.attrs["completed_patches"] = patch + 1
                     output_h5.flush()
                     detail_file.flush()
@@ -248,6 +265,8 @@ def evaluate(args):
             "best_epoch_zero_based": int(best["epoch"]) if "epoch" in best else None,
             "mode": "free_rollout_no_future_velocity_or_mask_as_input",
             "input_days": input_days,
+            "window_size": dataset.window_size,
+            "windows_per_patch": dataset.tiles_per_patch,
             "horizon_days": horizon,
             "first_input_day_index": first_input_day,
             "first_target_day_index": first_target_day,

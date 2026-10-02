@@ -65,6 +65,11 @@ class DistributedRuntime:
         dist.all_reduce(value, op=dist.ReduceOp.SUM)
         return (value / self.world_size).item()
 
+    def sum_int(self, local_value):
+        value = torch.tensor(int(local_value), dtype=torch.int64, device=self.device)
+        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+        return int(value.item())
+
     def weighted_mean(self, local_sum, local_count):
         values = torch.tensor((local_sum, local_count), dtype=torch.float64, device=self.device)
         dist.all_reduce(values, op=dist.ReduceOp.SUM)
