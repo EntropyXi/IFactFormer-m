@@ -73,25 +73,29 @@ def compute_train_uv_stats(dataset, train_sample_count, chunk_rows=16):
                 if weights.any():
                     accumulate(data[start:end], land_mask[start:end], weights)
         else:
-            # Reuse each daily selected crop for every training input window
-            # containing that day, without counting unselected land/ocean pixels.
-            for patch in range(patches):
-                start_count = int(starts_per_patch[patch])
-                if not start_count:
+            # H5 stores one compressed 448x448 chunk per row. Read contiguous
+            # rows once, then select each patch's fixed crop in memory; reading
+            # one patch across all days would cause thousands of random seeks.
+            for start in range(0, row_limit, chunk_rows):
+                end = min(start + chunk_rows, row_limit)
+                rows = np.arange(start, end)
+                day, patch = divmod(rows, patches)
+                first_start = np.maximum(0, day - window + 1)
+                last_start = np.minimum(day, starts_per_patch[patch] - 1)
+                weights = np.maximum(0, last_start - first_start + 1).astype(np.float64)
+                active = weights > 0
+                if not active.any():
                     continue
-                tile_row, tile_col = dataset.selected_tiles[patch]
-                y0, y1, x0, x1 = dataset.window_bounds(int(tile_row), int(tile_col))
-                day_limit = start_count + window - 1
-                for day_start in range(0, day_limit, chunk_rows):
-                    days = np.arange(day_start, min(day_start + chunk_rows, day_limit))
-                    first_start = np.maximum(0, days - window + 1)
-                    last_start = np.minimum(days, start_count - 1)
-                    weights = np.maximum(0, last_start - first_start + 1).astype(np.float64)
-                    active = weights > 0
-                    if active.any():
-                        rows = days[active] * patches + patch
-                        accumulate(data[rows, :, y0:y1, x0:x1],
-                                   land_mask[rows, y0:y1, x0:x1], weights[active])
+                uv = data[start:end]
+                land = land_mask[start:end]
+                selected = dataset.selected_tiles[patch]
+                tile_ids = selected[:, 0] * dataset.window_cols + selected[:, 1]
+                for tile_id in np.unique(tile_ids[active]):
+                    chosen = active & (tile_ids == tile_id)
+                    tile_row, tile_col = divmod(int(tile_id), dataset.window_cols)
+                    y0, y1, x0, x1 = dataset.window_bounds(tile_row, tile_col)
+                    accumulate(uv[chosen, :, y0:y1, x0:x1],
+                               land[chosen, y0:y1, x0:x1], weights[chosen])
 
     if valid_count <= 1:
         raise ValueError("training windows contain too few valid ocean pixels")
