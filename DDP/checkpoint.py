@@ -26,6 +26,7 @@ def save_latest(runtime, path, model, optimizer, scheduler, config, args, h5_pat
         "splits": splits,
         "patches_per_day": args.patches_per_day,
         "window_size": args.window_size,
+        "tile_selection": args.tile_selection,
         "seed": args.seed,
         "uv_mean": uv_mean.detach().cpu(),
         "uv_std": uv_std.detach().cpu(),
@@ -58,6 +59,8 @@ def verify_resume(checkpoint, config, args, h5_path, splits, runtime, samples_pe
         raise ValueError("Patch count or seed differs from the checkpoint")
     if checkpoint.get("window_size") != args.window_size:
         raise ValueError("Window size differs from the checkpoint")
+    if checkpoint.get("tile_selection", "all") != args.tile_selection:
+        raise ValueError("Tile selection differs from the checkpoint")
     if checkpoint["samples_per_rank"] != samples_per_rank:
         raise ValueError("Training sample count per rank differs from the checkpoint")
     if not 0 <= checkpoint["local_offset"] <= samples_per_rank:

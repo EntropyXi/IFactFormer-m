@@ -44,6 +44,9 @@ def parse_args():
     parser.add_argument("--patches-per-day", type=int, default=131)
     parser.add_argument("--window-size", type=int, default=112,
                         help="Non-overlapping spatial crop side length")
+    parser.add_argument("--tile-selection", choices=("most_ocean", "all"),
+                        default="most_ocean",
+                        help="Keep the highest-ocean crop per original patch (default), or all crops")
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--checkpoint-every-steps", type=int, default=100)
     parser.add_argument("--log-every-steps", type=int, default=100)
@@ -92,6 +95,7 @@ def save_latest(path, model, optimizer, scheduler, config, args, h5_path, splits
         "splits": splits,
         "patches_per_day": args.patches_per_day,
         "window_size": args.window_size,
+        "tile_selection": args.tile_selection,
         "seed": args.seed,
         "uv_mean": uv_mean.detach().cpu(),
         "uv_std": uv_std.detach().cpu(),
@@ -122,6 +126,8 @@ def verify_resume(checkpoint, config, args, h5_path, splits):
         raise ValueError("Patch count or shuffle seed differs from the checkpoint")
     if checkpoint.get("window_size") != args.window_size:
         raise ValueError("Window size differs from the checkpoint")
+    if checkpoint.get("tile_selection", "all") != args.tile_selection:
+        raise ValueError("Tile selection differs from the checkpoint")
     if checkpoint["epoch"] > config["training"]["epochs"]:
         raise ValueError("Configured epochs are fewer than completed epochs")
     if not 0 <= checkpoint["sample_offset"] <= splits[0]:
@@ -143,7 +149,8 @@ def run(args):
     h5_path = Path(args.h5).resolve()
     dataset = CopernicusH5Dataset(h5_path, patches_per_day=args.patches_per_day,
                                   input_days=config["model"]["in_time_window"],
-                                  window_size=args.window_size)
+                                  window_size=args.window_size,
+                                  tile_selection=args.tile_selection)
     splits = split_counts(dataset)
     ntrain, nval, ntest = splits
 

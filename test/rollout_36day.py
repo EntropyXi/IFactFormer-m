@@ -152,7 +152,8 @@ def evaluate(args):
     patches_per_day = int(latest["patches_per_day"])
     dataset = CopernicusH5Dataset(h5_path, patches_per_day=patches_per_day,
                                   input_days=input_days,
-                                  window_size=latest.get("window_size"))
+                                  window_size=latest.get("window_size"),
+                                  tile_selection=latest.get("tile_selection", "all"))
     try:
         splits = split_counts(dataset)
         if tuple(latest["splits"]) != splits:
@@ -266,7 +267,8 @@ def evaluate(args):
             "mode": "free_rollout_no_future_velocity_or_mask_as_input",
             "input_days": input_days,
             "window_size": dataset.window_size,
-            "windows_per_patch": dataset.tiles_per_patch,
+            "windows_per_patch": dataset.available_tiles_per_patch,
+            "training_windows_per_patch": dataset.tiles_per_patch,
             "horizon_days": horizon,
             "first_input_day_index": first_input_day,
             "first_target_day_index": first_target_day,

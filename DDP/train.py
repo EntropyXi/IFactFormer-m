@@ -61,7 +61,8 @@ def _run_ddp(args, runtime):
     h5_path = Path(args.h5).resolve()
     dataset = CopernicusH5Dataset(h5_path, patches_per_day=args.patches_per_day,
                                   input_days=config["model"]["in_time_window"],
-                                  window_size=args.window_size)
+                                  window_size=args.window_size,
+                                  tile_selection=args.tile_selection)
     try:
         splits = split_counts(dataset)
         ntrain, nval, ntest = splits

@@ -22,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def make_fixture(directory):
     h5_path = directory / "tiny.h5"
     config_path = directory / "tiny.yml"
-    days, patches, height, width = 16, 2, 4, 5
+    days, patches, height, width = 16, 2, 4, 4
     rows = days * patches
     rng = np.random.default_rng(42)
     data = rng.normal(size=(rows, 2, height, width)).astype(np.float32)
@@ -60,7 +60,7 @@ def invoke(h5_path, config_path, run_dir=None, resume=None, stop_after=None,
         port = listener.getsockname()[1]
     command = [sys.executable, "-B", "main.py", "--ddp", "--device", "cpu",
                "--config", str(config_path), "--h5", str(h5_path),
-               "--patches-per-day", "2", "--num-workers", "0",
+               "--patches-per-day", "2", "--window-size", "2", "--num-workers", "0",
                "--checkpoint-every-steps", "2", "--log-every-steps", "2"]
     if run_dir is not None:
         command += ["--run-dir", str(run_dir)]
@@ -78,7 +78,7 @@ def invoke(h5_path, config_path, run_dir=None, resume=None, stop_after=None,
                             "MASTER_PORT": str(port), "OMP_NUM_THREADS": "1"})
         processes.append(subprocess.Popen(command, cwd=ROOT, env=environment,
                                           text=True, stdout=subprocess.PIPE,
-                                          stderr=subprocess.PIPE))
+                                          stderr=subprocess.PIPE, errors="replace"))
     try:
         outputs = [process.communicate(timeout=180) for process in processes]
     except subprocess.TimeoutExpired:
@@ -96,7 +96,7 @@ def invoke_single(h5_path, config_path, run_dir=None, resume=None, stop_after=No
                   activation_checkpoint=False):
     command = [sys.executable, "-B", "main.py", "--device", "cpu",
                "--config", str(config_path), "--h5", str(h5_path),
-               "--patches-per-day", "2", "--num-workers", "0",
+               "--patches-per-day", "2", "--window-size", "2", "--num-workers", "0",
                "--checkpoint-every-steps", "2"]
     if run_dir is not None:
         command += ["--run-dir", str(run_dir)]

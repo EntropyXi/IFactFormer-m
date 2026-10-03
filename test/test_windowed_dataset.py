@@ -57,12 +57,13 @@ def test_exact_112_layout(root):
     try:
         assert dataset.source_spatial_shape == (448, 448)
         assert dataset.spatial_shape == (112, 112)
-        assert dataset.tiles_per_patch == 16
-        assert dataset.samples_per_day == 32
-        assert len(dataset) == 32
-        assert dataset.decode_index(31) == (0, 1, 3, 3)
+        assert dataset.available_tiles_per_patch == 16
+        assert dataset.tiles_per_patch == 1
+        assert dataset.samples_per_day == 2
+        assert len(dataset) == 2
+        assert dataset.decode_index(1) == (0, 1, 0, 0)
         assert dataset.window_bounds(3, 3) == (336, 448, 336, 448)
-        x, y, valid, positions = dataset[31]
+        x, y, valid, positions = dataset[1]
         assert x.shape == (7, 112, 112, 3)
         assert y.shape == (112, 112, 2)
         assert valid.shape == (112, 112)
@@ -73,7 +74,8 @@ def test_exact_112_layout(root):
 
 def test_dataset_and_loss(path):
     full = CopernicusH5Dataset(path, patches_per_day=2, input_days=7)
-    tiled = CopernicusH5Dataset(path, patches_per_day=2, input_days=7, window_size=2)
+    tiled = CopernicusH5Dataset(path, patches_per_day=2, input_days=7,
+                                window_size=2, tile_selection="all")
     try:
         assert tiled.tiles_per_patch == 4
         assert tiled.samples_per_day == 8
@@ -129,8 +131,38 @@ def test_dataset_and_loss(path):
         full.close()
 
 
+def test_most_ocean_selection_and_stats(path):
+    selected = CopernicusH5Dataset(path, patches_per_day=2, input_days=7,
+                                   window_size=2)
+    try:
+        assert selected.available_tiles_per_patch == 4
+        assert selected.tiles_per_patch == 1
+        assert selected.samples_per_day == 2
+        assert len(selected) == 66  # 33 start days, two original patches per day.
+        assert split_counts(selected) == (52, 6, 8)
+        assert selected.decode_index(0) == (0, 0, 0, 1)
+        assert selected.decode_index(1) == (0, 1, 0, 1)
+        assert selected.decode_index(2) == (1, 0, 0, 1)
+        assert selected.decode_index(65) == (32, 1, 0, 1)
+
+        # Compare streamed training-only statistics with the exact pixels read
+        # by the selected training samples, including repeated input days.
+        values = []
+        for index in range(split_counts(selected)[0]):
+            x, _, valid, _ = selected[index]
+            assert valid.any()
+            values.append(x[..., :2][x[..., 2].bool()])
+        ocean_uv = torch.cat(values)
+        mean, std = compute_train_uv_stats(selected, split_counts(selected)[0], chunk_rows=3)
+        torch.testing.assert_close(mean, ocean_uv.mean(dim=0))
+        torch.testing.assert_close(std, ocean_uv.std(dim=0, unbiased=True))
+    finally:
+        selected.close()
+
+
 def test_windowed_evaluators(path, root):
-    dataset = CopernicusH5Dataset(path, patches_per_day=2, input_days=7, window_size=2)
+    dataset = CopernicusH5Dataset(path, patches_per_day=2, input_days=7,
+                                  window_size=2, tile_selection="all")
     run_dir = root / "run"
     run_dir.mkdir()
     config = {"in_dim": 3, "out_dim": 2, "in_time_window": 7, "dim": 24,
@@ -176,6 +208,35 @@ def test_windowed_evaluators(path, root):
         assert np.all(output["pred_uv"][:, :, :, :2, :2] == 0)
 
 
+def test_selected_one_step_evaluator(path, root):
+    dataset = CopernicusH5Dataset(path, patches_per_day=2, input_days=7, window_size=2)
+    run_dir = root / "selected_eval"
+    run_dir.mkdir()
+    config = {"in_dim": 3, "out_dim": 2, "in_time_window": 7, "dim": 24,
+              "heads": 2, "depth": 1, "dim_head": 16, "n_layer": 1,
+              "model": "IFactFormer_m"}
+    model = Model(dict2namespace(config))
+    torch.save({"model_config": config, "h5_path": str(path), "patches_per_day": 2,
+                "window_size": 2, "tile_selection": "most_ocean",
+                "splits": split_counts(dataset),
+                "uv_mean": torch.zeros(2), "uv_std": torch.ones(2)},
+               run_dir / "checkpoint_latest.pt")
+    torch.save({"model": model.state_dict(), "epoch": 0}, run_dir / "checkpoint_best.pth")
+    dataset.close()
+
+    output_dir = run_dir / "one_step"
+    command = [sys.executable, "-B", str(TEST_DIR / "evaluate_one_step.py"),
+               "--run-dir", str(run_dir), "--device", "cpu", "--num-workers", "0",
+               "--plot-count", "0", "--max-samples", "4", "--output-dir", str(output_dir)]
+    result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, timeout=120)
+    if result.returncode:
+        raise AssertionError(f"Selected one-step evaluation failed:\n{result.stdout}\n{result.stderr}")
+    with (output_dir / "per_sample.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [(int(row["patch_index"]), int(row["tile_row"]), int(row["tile_col"]))
+            for row in rows] == [(0, 0, 1), (1, 0, 1), (0, 0, 1), (1, 0, 1)]
+
+
 def test_training_entrypoint(path, root):
     config = {"log_dir": str(root),
               "model": {"in_dim": 3, "out_dim": 2, "in_time_window": 7,
@@ -196,7 +257,8 @@ def test_training_entrypoint(path, root):
     checkpoint = torch.load(run_dir / "checkpoint_latest.pt", map_location="cpu",
                             weights_only=True)
     assert checkpoint["window_size"] == 2
-    assert tuple(checkpoint["splits"]) == (208, 24, 32)
+    assert checkpoint["tile_selection"] == "most_ocean"
+    assert tuple(checkpoint["splits"]) == (52, 6, 8)
     assert checkpoint["global_step"] == 1
 
 
@@ -226,6 +288,7 @@ def test_ddp_training_entrypoint(path, root):
         checkpoint = torch.load(run_dir / "checkpoint_latest.pt", map_location="cpu",
                                 weights_only=True)
         assert checkpoint["window_size"] == 2
+        assert checkpoint["tile_selection"] == "most_ocean"
         assert checkpoint["world_size"] == 2
         assert checkpoint["global_step"] == 1
     finally:
@@ -241,7 +304,9 @@ if __name__ == "__main__":
         test_exact_112_layout(root)
         path = make_fixture(root)
         test_dataset_and_loss(path)
+        test_most_ocean_selection_and_stats(path)
         test_windowed_evaluators(path, root)
+        test_selected_one_step_evaluator(path, root)
         test_training_entrypoint(path, root)
         if os.environ.get("IFACT_TEST_DDP") == "1":
             test_ddp_training_entrypoint(path, root)

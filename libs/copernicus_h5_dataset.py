@@ -35,8 +35,7 @@ def compute_train_uv_stats(dataset, train_sample_count, chunk_rows=16):
         raise ValueError("chunk_rows must be positive")
 
     if train_sample_count % dataset.tiles_per_patch:
-        raise ValueError("training sample count must include complete spatial tilings")
-    # Each complete tiling covers exactly the pixels of one original H5 patch.
+        raise ValueError("training sample count must include complete patch samples")
     train_patch_count = train_sample_count // dataset.tiles_per_patch
     patches = dataset.patches_per_day
     window = dataset.input_days
@@ -48,27 +47,51 @@ def compute_train_uv_stats(dataset, train_sample_count, chunk_rows=16):
     sums = np.zeros(2, dtype=np.float64)
     squared_sums = np.zeros(2, dtype=np.float64)
     valid_count = 0.0
+
+    def accumulate(uv, land, weights):
+        nonlocal valid_count
+        valid = (~land.astype(bool)) & np.isfinite(uv).all(axis=1)
+        valid_count += np.sum(valid * weights[:, None, None], dtype=np.float64)
+        for channel in range(2):
+            values = np.where(valid, uv[:, channel], 0).astype(np.float64)
+            weighted = values * weights[:, None, None]
+            sums[channel] += np.sum(weighted, dtype=np.float64)
+            squared_sums[channel] += np.sum(weighted * values, dtype=np.float64)
+
     with h5py.File(dataset.path, "r") as h5_file:
         data = h5_file["uovo_data"]
         land_mask = h5_file["mask"]
-        for start in range(0, row_limit, chunk_rows):
-            end = min(start + chunk_rows, row_limit)
-            rows = np.arange(start, end)
-            day, patch = divmod(rows, patches)
-            first_start = np.maximum(0, day - window + 1)
-            last_start = np.minimum(day, starts_per_patch[patch] - 1)
-            weights = np.maximum(0, last_start - first_start + 1).astype(np.float64)
-            if not weights.any():
-                continue
-
-            uv = data[start:end]
-            valid = (~land_mask[start:end]) & np.isfinite(uv).all(axis=1)
-            valid_count += np.sum(valid * weights[:, None, None], dtype=np.float64)
-            for channel in range(2):
-                values = np.where(valid, uv[:, channel], 0).astype(np.float64)
-                weighted = values * weights[:, None, None]
-                sums[channel] += np.sum(weighted, dtype=np.float64)
-                squared_sums[channel] += np.sum(weighted * values, dtype=np.float64)
+        if dataset.tile_selection == "all":
+            # A complete tiling covers every pixel of each original H5 patch.
+            for start in range(0, row_limit, chunk_rows):
+                end = min(start + chunk_rows, row_limit)
+                rows = np.arange(start, end)
+                day, patch = divmod(rows, patches)
+                first_start = np.maximum(0, day - window + 1)
+                last_start = np.minimum(day, starts_per_patch[patch] - 1)
+                weights = np.maximum(0, last_start - first_start + 1).astype(np.float64)
+                if weights.any():
+                    accumulate(data[start:end], land_mask[start:end], weights)
+        else:
+            # Reuse each daily selected crop for every training input window
+            # containing that day, without counting unselected land/ocean pixels.
+            for patch in range(patches):
+                start_count = int(starts_per_patch[patch])
+                if not start_count:
+                    continue
+                tile_row, tile_col = dataset.selected_tiles[patch]
+                y0, y1, x0, x1 = dataset.window_bounds(int(tile_row), int(tile_col))
+                day_limit = start_count + window - 1
+                for day_start in range(0, day_limit, chunk_rows):
+                    days = np.arange(day_start, min(day_start + chunk_rows, day_limit))
+                    first_start = np.maximum(0, days - window + 1)
+                    last_start = np.minimum(days, start_count - 1)
+                    weights = np.maximum(0, last_start - first_start + 1).astype(np.float64)
+                    active = weights > 0
+                    if active.any():
+                        rows = days[active] * patches + patch
+                        accumulate(data[rows, :, y0:y1, x0:x1],
+                                   land_mask[rows, y0:y1, x0:x1], weights[active])
 
     if valid_count <= 1:
         raise ValueError("training windows contain too few valid ocean pixels")
@@ -84,20 +107,27 @@ def compute_train_uv_stats(dataset, train_sample_count, chunk_rows=16):
 class CopernicusH5Dataset(Dataset):
     """Return velocity + ocean mask, target, target mask and coordinates."""
 
-    def __init__(self, path, patches_per_day=131, input_days=7, window_size=None):
+    def __init__(self, path, patches_per_day=131, input_days=7, window_size=None,
+                 tile_selection="most_ocean"):
         self.path = os.fspath(path)
         self.patches_per_day = patches_per_day
         self.input_days = input_days
         if patches_per_day <= 0 or input_days <= 0:
             raise ValueError("patches_per_day and input_days must be positive")
+        if tile_selection not in ("most_ocean", "all"):
+            raise ValueError("tile_selection must be 'most_ocean' or 'all'")
+        self.tile_selection = tile_selection
 
         # Read only metadata here; worker processes open their own H5 handle.
         with h5py.File(self.path, "r") as h5_file:
             shape = h5_file["uovo_data"].shape
+            mask_shape = h5_file["mask"].shape
         if len(shape) != 4 or shape[1] != 2:
             raise ValueError(f"Expected uovo_data [N, 2, H, W], got {shape}")
         if shape[0] % patches_per_day:
             raise ValueError("uovo_data length is not divisible by patches_per_day")
+        if mask_shape != (shape[0], *shape[2:]):
+            raise ValueError(f"Expected mask [N, H, W], got {mask_shape}")
 
         self.num_days = shape[0] // patches_per_day
         self.source_spatial_shape = shape[2:]
@@ -109,9 +139,25 @@ class CopernicusH5Dataset(Dataset):
         self.window_width = window_size or shape[3]
         self.window_rows = shape[2] // self.window_height
         self.window_cols = shape[3] // self.window_width
-        self.tiles_per_patch = self.window_rows * self.window_cols
+        self.available_tiles_per_patch = self.window_rows * self.window_cols
+        self.tiles_per_patch = (1 if tile_selection == "most_ocean"
+                                else self.available_tiles_per_patch)
         self.samples_per_day = patches_per_day * self.tiles_per_patch
         self.spatial_shape = (self.window_height, self.window_width)
+        self.selected_tiles = None
+        if tile_selection == "most_ocean":
+            selected = np.empty((patches_per_day, 2), dtype=np.int16)
+            with h5py.File(self.path, "r") as h5_file:
+                mask = h5_file["mask"]
+                for patch in range(patches_per_day):
+                    # The geographic land mask is fixed per patch. Select once
+                    # from day 0; argmax breaks ties in row-major order.
+                    ocean = (~np.asarray(mask[patch], dtype=bool)).reshape(
+                        self.window_rows, self.window_height,
+                        self.window_cols, self.window_width)
+                    counts = ocean.sum(axis=(1, 3))
+                    selected[patch] = np.unravel_index(int(counts.argmax()), counts.shape)
+            self.selected_tiles = selected
         self._h5_file = None
         self._data = None
         self._mask = None
@@ -127,7 +173,10 @@ class CopernicusH5Dataset(Dataset):
             raise IndexError(index)
         day, sample_in_day = divmod(index, self.samples_per_day)
         patch, tile = divmod(sample_in_day, self.tiles_per_patch)
-        tile_row, tile_col = divmod(tile, self.window_cols)
+        if self.tile_selection == "most_ocean":
+            tile_row, tile_col = map(int, self.selected_tiles[patch])
+        else:
+            tile_row, tile_col = divmod(tile, self.window_cols)
         return day, patch, tile_row, tile_col
 
     def window_bounds(self, tile_row, tile_col):

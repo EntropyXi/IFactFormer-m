@@ -163,7 +163,8 @@ def evaluate(args):
     dataset = CopernicusH5Dataset(
         h5_path, patches_per_day=int(latest["patches_per_day"]),
         input_days=int(latest["model_config"]["in_time_window"]),
-        window_size=latest.get("window_size"))
+        window_size=latest.get("window_size"),
+        tile_selection=latest.get("tile_selection", "all"))
     try:
         splits = split_counts(dataset)
         if tuple(latest["splits"]) != splits:
